@@ -7,10 +7,12 @@
  * ("Weather" in the effects list) plus a background data-fetcher.
  *
  *   Bar 1 (T): outdoor temperature; arrow = warmer/colder 24h from now
- *   Bar 2 (P): "niceness" = 100-precip% over next 6h; arrow = following 18h better/worse
+ *   Bar 2 (P): chance of rain (precip %) over next 6h; arrow = following 18h more/less rain
  *   Bar 3 (W): tide level (live NOAA water level); arrow = rising(in)/falling(out)
+ *   Bar 4 (A): air quality (US AQI, taller = worse); arrow = worsening/improving 24h out
  *
- * Data: Open-Meteo over plain HTTP (no TLS); NOAA over one insecure HTTPS call.
+ * Data: Open-Meteo weather + air-quality over plain HTTP (no TLS); NOAA over one
+ * insecure HTTPS call.
  * The usermod's loop() refreshes data every WT_REFRESH_MS into member fields.
  * The effect renders those fields; select it on a segment to show the dashboard.
  *
@@ -42,20 +44,24 @@ class WeatherTideUsermod : public Usermod {
     static const int BAR_H = 10;      // fill height (rows 4..13)
     static const int ARROW_Y = 0;     // arrows on rows 0..2
     static const int LABEL_Y = 15;    // letters on rows 15..19
-    static constexpr int BAR_X[3] = {2, 8, 14};
+    static constexpr int BAR_X[4] = {1, 6, 11, 16};
 
     static constexpr float TEMP_MIN = 20.0f, TEMP_MAX = 90.0f;
     static constexpr float TIDE_MIN = 0.0f,  TIDE_MAX = 4.2f;
+    static constexpr float AQI_MAX  = 200.0f;   // US AQI scaled to full bar
 
     // ---- cached data (read by the effect) ----
     float    tempNow   = 60.0f;
     int      tempDir   = 0;           // -1 down, 0 flat, +1 up
-    float    good6     = 1.0f;        // 0..1 niceness next 6h
+    float    rain6     = 0.0f;        // 0..1 chance of rain next 6h
     int      precipDir = 0;
     bool     tideValid = false;
     float    tideFrac  = 0.5f;
     int      tideDir   = 0;
     float    prevTide  = -1000.0f;
+    bool     aqiValid  = false;
+    float    aqiFrac   = 0.0f;        // 0..1 of AQI_MAX
+    int      aqiDir    = 0;
 
     unsigned long lastFetch = 0;
     bool     firstRun = true;
@@ -106,6 +112,7 @@ class WeatherTideUsermod : public Usermod {
       static const uint8_t GT[5] = {0b111,0b010,0b010,0b010,0b010};
       static const uint8_t GP[5] = {0b111,0b101,0b111,0b100,0b100};
       static const uint8_t GW[5] = {0b101,0b101,0b101,0b111,0b101};
+      static const uint8_t GA[5] = {0b010,0b101,0b111,0b101,0b101};
       static const uint8_t A_UP[3]   = {0b010,0b111,0b000};
       static const uint8_t A_DOWN[3] = {0b000,0b111,0b010};
       static const uint8_t A_FLAT[3] = {0b000,0b111,0b000};
@@ -113,10 +120,12 @@ class WeatherTideUsermod : public Usermod {
       float tf = (u->tempNow - TEMP_MIN) / (TEMP_MAX - TEMP_MIN);
       uint32_t tc = pal(tf);
       drawBar(BAR_X[0], tf, tc);
-      uint32_t pc = pal(u->good6);
-      drawBar(BAR_X[1], u->good6, pc);
+      uint32_t pc = pal(u->rain6);
+      drawBar(BAR_X[1], u->rain6, pc);
       uint32_t wc = u->tideValid ? pal(u->tideFrac) : RGBW32(60,60,80,0);
       drawBar(BAR_X[2], u->tideValid ? u->tideFrac : 0.0f, wc);
+      uint32_t qc = u->aqiValid ? pal(u->aqiFrac) : RGBW32(60,60,80,0);
+      drawBar(BAR_X[3], u->aqiValid ? u->aqiFrac : 0.0f, qc);
 
       uint32_t dv = RGBW32(35,35,50,0);
       for (int x = 1; x < N - 1; x++) px(x, 14, dv);
@@ -125,9 +134,12 @@ class WeatherTideUsermod : public Usermod {
       const uint8_t* pa = u->precipDir>0?A_UP:u->precipDir<0?A_DOWN:A_FLAT;
       int wdir = u->tideValid ? u->tideDir : 0;
       const uint8_t* wa = wdir>0?A_UP:wdir<0?A_DOWN:A_FLAT;
+      int qdir = u->aqiValid ? u->aqiDir : 0;
+      const uint8_t* qa = qdir>0?A_UP:qdir<0?A_DOWN:A_FLAT;
       drawGlyph(BAR_X[0], ARROW_Y, ta, 3, tc);
       drawGlyph(BAR_X[1], ARROW_Y, pa, 3, pc);
       drawGlyph(BAR_X[2], ARROW_Y, wa, 3, wc);
+      drawGlyph(BAR_X[3], ARROW_Y, qa, 3, qc);
 
       auto dim = [](uint32_t c)->uint32_t{
         uint8_t r=(c>>16)&0xFF,g=(c>>8)&0xFF,b=c&0xFF;
@@ -136,6 +148,7 @@ class WeatherTideUsermod : public Usermod {
       drawGlyph(BAR_X[0], LABEL_Y, GT, 5, dim(tc));
       drawGlyph(BAR_X[1], LABEL_Y, GP, 5, dim(pc));
       drawGlyph(BAR_X[2], LABEL_Y, GW, 5, dim(wc));
+      drawGlyph(BAR_X[3], LABEL_Y, GA, 5, dim(qc));
       return FRAMETIME;
     }
 
@@ -188,10 +201,36 @@ class WeatherTideUsermod : public Usermod {
         for (int i = 1; i <= 6;  i++)  p6  += (float)(probs[i] | 0);
         for (int i = 7; i <= 24; i++)  p18 += (float)(probs[i] | 0);
         p6 /= 6.0f; p18 /= 18.0f;
-        good6 = 1.0f - p6 / 100.0f;
-        precipDir = trend((1.0f - p18/100.0f) - good6, 0.10f);
+        rain6 = p6 / 100.0f;                     // chance of rain next 6h
+        precipDir = trend(p18 - p6, 10.0f);      // up = more rain in the following 18h
         float t24 = temps[24] | tempNow;
         tempDir = trend(t24 - tempNow, 1.0f);
+        return true;
+      });
+    }
+
+    void fetchAirQuality() {
+      char path[192];
+      snprintf(path, sizeof(path),
+        "/v1/air-quality?latitude=%.4f&longitude=%.4f"
+        "&current=us_aqi&hourly=us_aqi&forecast_hours=25&timezone=America%%2FNew_York",
+        (double)WT_LAT, (double)WT_LON);
+
+      StaticJsonDocument<128> filter;
+      filter["current"]["us_aqi"] = true;
+      filter["hourly"]["us_aqi"] = true;
+
+      fetchJson(false, "air-quality-api.open-meteo.com", String(path), [&](Stream& s) -> bool {
+        DynamicJsonDocument doc(2048);
+        DeserializationError err = deserializeJson(doc, s, DeserializationOption::Filter(filter));
+        if (err) { DEBUG_PRINTF("[WT] aqi json err: %s\n", err.c_str()); return false; }
+        float aqi = doc["current"]["us_aqi"] | -1.0f;
+        if (aqi < 0) return false;
+        aqiFrac = aqi / AQI_MAX;
+        if (aqiFrac < 0) aqiFrac = 0; if (aqiFrac > 1) aqiFrac = 1;
+        JsonArray aq = doc["hourly"]["us_aqi"];
+        if (aq.size() >= 25) aqiDir = trend((float)(aq[24] | (int)aqi) - aqi, 10.0f);
+        aqiValid = true;
         return true;
       });
     }
@@ -237,8 +276,9 @@ class WeatherTideUsermod : public Usermod {
         lastFetch = now;
         fetchWeather();
         fetchTide();
-        DEBUG_PRINTF("[WT] temp=%.1f(%d) nice6=%.2f(%d) tideFrac=%.2f(%d)\n",
-                     tempNow, tempDir, good6, precipDir, tideFrac, tideDir);
+        fetchAirQuality();
+        DEBUG_PRINTF("[WT] temp=%.1f(%d) rain6=%.2f(%d) tideFrac=%.2f(%d) aqiFrac=%.2f(%d)\n",
+                     tempNow, tempDir, rain6, precipDir, tideFrac, tideDir, aqiFrac, aqiDir);
       }
     }
 
@@ -246,4 +286,4 @@ class WeatherTideUsermod : public Usermod {
 };
 
 WeatherTideUsermod* WeatherTideUsermod::instance = nullptr;
-constexpr int WeatherTideUsermod::BAR_X[3];
+constexpr int WeatherTideUsermod::BAR_X[4];
