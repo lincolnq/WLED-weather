@@ -1,0 +1,249 @@
+#pragma once
+#include "wled.h"
+#include <WiFiClientSecure.h>
+
+/*
+ * Weather + Tide dashboard, implemented as a selectable WLED 2D effect
+ * ("Weather" in the effects list) plus a background data-fetcher.
+ *
+ *   Bar 1 (T): outdoor temperature; arrow = warmer/colder 24h from now
+ *   Bar 2 (P): "niceness" = 100-precip% over next 6h; arrow = following 18h better/worse
+ *   Bar 3 (W): tide level (live NOAA water level); arrow = rising(in)/falling(out)
+ *
+ * Data: Open-Meteo over plain HTTP (no TLS); NOAA over one insecure HTTPS call.
+ * The usermod's loop() refreshes data every WT_REFRESH_MS into member fields.
+ * The effect renders those fields; select it on a segment to show the dashboard.
+ *
+ * Design coords are upright (x=0 left, y=0 top) then mapped to the panel with a
+ * 90-degrees-CCW rotation to match this wall's wiring.
+ */
+
+#ifndef WT_LAT
+#define WT_LAT 41.3540
+#endif
+#ifndef WT_LON
+#define WT_LON -71.9662
+#endif
+#ifndef WT_TIDE_STATION
+#define WT_TIDE_STATION "8461490"     // NOAA New London (nearest live sensor to Mystic)
+#endif
+#ifndef WT_REFRESH_MS
+#define WT_REFRESH_MS 600000UL        // 10 minutes
+#endif
+
+static const char _data_FX_MODE_WEATHER[] PROGMEM = "Weather@;;!;2;pal=11";
+
+class WeatherTideUsermod : public Usermod {
+  private:
+    // ---- design geometry (upright) ----
+    static const int N = 20;
+    static const int BAR_W = 3;
+    static const int BASE_Y = 13;     // bottom row of bars
+    static const int BAR_H = 10;      // fill height (rows 4..13)
+    static const int ARROW_Y = 0;     // arrows on rows 0..2
+    static const int LABEL_Y = 15;    // letters on rows 15..19
+    static constexpr int BAR_X[3] = {2, 8, 14};
+
+    static constexpr float TEMP_MIN = 20.0f, TEMP_MAX = 90.0f;
+    static constexpr float TIDE_MIN = 0.0f,  TIDE_MAX = 4.2f;
+
+    // ---- cached data (read by the effect) ----
+    float    tempNow   = 60.0f;
+    int      tempDir   = 0;           // -1 down, 0 flat, +1 up
+    float    good6     = 1.0f;        // 0..1 niceness next 6h
+    int      precipDir = 0;
+    bool     tideValid = false;
+    float    tideFrac  = 0.5f;
+    int      tideDir   = 0;
+    float    prevTide  = -1000.0f;
+
+    unsigned long lastFetch = 0;
+    bool     firstRun = true;
+    bool     effectRegistered = false;
+
+    static WeatherTideUsermod* instance;   // for the static effect function
+
+    // -------- small helpers --------
+    static int trend(float delta, float dead) {
+      if (delta >  dead) return  1;
+      if (delta < -dead) return -1;
+      return 0;
+    }
+    // sample the active palette at fraction f (0..1)
+    static uint32_t pal(float f) {
+      if (f < 0) f = 0; if (f > 1) f = 1;
+      bool wrap = (strip.paletteBlend == 1 || strip.paletteBlend == 3);
+      return SEGMENT.color_from_palette((uint8_t)(f * 255.0f), true, wrap, 0);
+    }
+
+    // upright design pixel -> panel (90 CCW). Adjust here if orientation is off.
+    static inline void px(int xd, int yd, uint32_t c) {
+      int rows = SEGMENT.virtualHeight();
+      SEGMENT.setPixelColorXY(yd, (rows - 1) - xd, c);
+    }
+    static void drawGlyph(int x0, int y0, const uint8_t* rows, int nrows, uint32_t c) {
+      for (int gy = 0; gy < nrows; gy++)
+        for (int gx = 0; gx < 3; gx++)
+          if (rows[gy] & (1 << (2 - gx))) px(x0 + gx, y0 + gy, c);
+    }
+    static void drawBar(int x0, float frac, uint32_t color) {
+      if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+      int h = (int)(frac * BAR_H + 0.5f);
+      uint32_t track = RGBW32(12,12,18,0);
+      for (int x = x0; x < x0 + BAR_W; x++) {
+        for (int i = 0; i < BAR_H; i++) px(x, BASE_Y - i, track);
+        for (int i = 0; i < h;     i++) px(x, BASE_Y - i, color);
+      }
+    }
+
+    // -------- the effect --------
+    static uint16_t mode_weather() {
+      if (!strip.isMatrix || !SEGMENT.is2D()) { SEGMENT.fill(0); return FRAMETIME; }
+      SEGMENT.fill(0);                              // clean black background
+      WeatherTideUsermod* u = instance;
+      if (!u) return FRAMETIME;
+
+      static const uint8_t GT[5] = {0b111,0b010,0b010,0b010,0b010};
+      static const uint8_t GP[5] = {0b111,0b101,0b111,0b100,0b100};
+      static const uint8_t GW[5] = {0b101,0b101,0b101,0b111,0b101};
+      static const uint8_t A_UP[3]   = {0b010,0b111,0b000};
+      static const uint8_t A_DOWN[3] = {0b000,0b111,0b010};
+      static const uint8_t A_FLAT[3] = {0b000,0b111,0b000};
+
+      float tf = (u->tempNow - TEMP_MIN) / (TEMP_MAX - TEMP_MIN);
+      uint32_t tc = pal(tf);
+      drawBar(BAR_X[0], tf, tc);
+      uint32_t pc = pal(u->good6);
+      drawBar(BAR_X[1], u->good6, pc);
+      uint32_t wc = u->tideValid ? pal(u->tideFrac) : RGBW32(60,60,80,0);
+      drawBar(BAR_X[2], u->tideValid ? u->tideFrac : 0.0f, wc);
+
+      uint32_t dv = RGBW32(35,35,50,0);
+      for (int x = 1; x < N - 1; x++) px(x, 14, dv);
+
+      const uint8_t* ta = u->tempDir>0?A_UP:u->tempDir<0?A_DOWN:A_FLAT;
+      const uint8_t* pa = u->precipDir>0?A_UP:u->precipDir<0?A_DOWN:A_FLAT;
+      int wdir = u->tideValid ? u->tideDir : 0;
+      const uint8_t* wa = wdir>0?A_UP:wdir<0?A_DOWN:A_FLAT;
+      drawGlyph(BAR_X[0], ARROW_Y, ta, 3, tc);
+      drawGlyph(BAR_X[1], ARROW_Y, pa, 3, pc);
+      drawGlyph(BAR_X[2], ARROW_Y, wa, 3, wc);
+
+      auto dim = [](uint32_t c)->uint32_t{
+        uint8_t r=(c>>16)&0xFF,g=(c>>8)&0xFF,b=c&0xFF;
+        return RGBW32((r*9)/10,(g*9)/10,(b*9)/10,0);
+      };
+      drawGlyph(BAR_X[0], LABEL_Y, GT, 5, dim(tc));
+      drawGlyph(BAR_X[1], LABEL_Y, GP, 5, dim(pc));
+      drawGlyph(BAR_X[2], LABEL_Y, GW, 5, dim(wc));
+      return FRAMETIME;
+    }
+
+    // -------- data fetch (manual HTTP/1.0, mirrors in-tree klipper usermod) --------
+    bool doReq(Client& c, const char* host, uint16_t port, const String& path,
+               std::function<bool(Stream&)> parse) {
+      c.setTimeout(5000);
+      if (!c.connect(host, port)) { DEBUG_PRINTLN(F("[WT] connect failed")); return false; }
+      c.print(F("GET ")); c.print(path); c.print(F(" HTTP/1.0\r\nHost: "));
+      c.print(host);
+      c.print(F("\r\nUser-Agent: wled\r\nConnection: close\r\n\r\n"));
+      bool ok = false;
+      if (c.find((char*)"\r\n\r\n")) ok = parse(c);   // skip headers
+      c.stop();
+      return ok;
+    }
+    bool fetchJson(bool secure, const char* host, const String& path,
+                   std::function<bool(Stream&)> parse) {
+      if (secure) {
+        WiFiClientSecure c; c.setInsecure();
+        return doReq(c, host, 443, path, parse);
+      } else {
+        WiFiClient c;
+        return doReq(c, host, 80, path, parse);
+      }
+    }
+
+    void fetchWeather() {
+      char path[224];
+      snprintf(path, sizeof(path),
+        "/v1/forecast?latitude=%.4f&longitude=%.4f"
+        "&current=temperature_2m&hourly=temperature_2m,precipitation_probability"
+        "&forecast_hours=25&temperature_unit=fahrenheit&timezone=America%%2FNew_York",
+        (double)WT_LAT, (double)WT_LON);
+
+      StaticJsonDocument<192> filter;
+      filter["current"]["temperature_2m"] = true;
+      filter["hourly"]["temperature_2m"] = true;
+      filter["hourly"]["precipitation_probability"] = true;
+
+      fetchJson(false, "api.open-meteo.com", String(path), [&](Stream& s) -> bool {
+        DynamicJsonDocument doc(4096);
+        DeserializationError err = deserializeJson(doc, s, DeserializationOption::Filter(filter));
+        if (err) { DEBUG_PRINTF("[WT] weather json err: %s\n", err.c_str()); return false; }
+        tempNow = doc["current"]["temperature_2m"] | tempNow;
+        JsonArray temps = doc["hourly"]["temperature_2m"];
+        JsonArray probs = doc["hourly"]["precipitation_probability"];
+        if (temps.size() < 25 || probs.size() < 25) return false;
+        float p6 = 0, p18 = 0;
+        for (int i = 1; i <= 6;  i++)  p6  += (float)(probs[i] | 0);
+        for (int i = 7; i <= 24; i++)  p18 += (float)(probs[i] | 0);
+        p6 /= 6.0f; p18 /= 18.0f;
+        good6 = 1.0f - p6 / 100.0f;
+        precipDir = trend((1.0f - p18/100.0f) - good6, 0.10f);
+        float t24 = temps[24] | tempNow;
+        tempDir = trend(t24 - tempNow, 1.0f);
+        return true;
+      });
+    }
+
+    void fetchTide() {
+      String path = String("/api/prod/datagetter?date=latest&station=") + WT_TIDE_STATION +
+                    "&product=water_level&datum=MLLW&time_zone=lst_ldt&units=english"
+                    "&application=wled_ledwall&format=json";
+      fetchJson(true, "api.tidesandcurrents.noaa.gov", path, [&](Stream& s) -> bool {
+        DynamicJsonDocument doc(1024);
+        DeserializationError err = deserializeJson(doc, s);
+        if (err) { DEBUG_PRINTF("[WT] tide json err: %s\n", err.c_str()); return false; }
+        JsonArray data = doc["data"];
+        if (data.isNull() || data.size() == 0) return false;
+        const char* v = data[0]["v"];
+        if (!v) return false;
+        float level = atof(v);
+        tideFrac = (level - TIDE_MIN) / (TIDE_MAX - TIDE_MIN);
+        if (tideFrac < 0) tideFrac = 0; if (tideFrac > 1) tideFrac = 1;
+        if (prevTide > -999.0f) tideDir = trend(level - prevTide, 0.03f);
+        prevTide = level;
+        tideValid = true;
+        return true;
+      });
+    }
+
+  public:
+    WeatherTideUsermod() { instance = this; }
+
+    void setup() override {
+      if (!effectRegistered) {
+        strip.addEffect(255, &WeatherTideUsermod::mode_weather, _data_FX_MODE_WEATHER);
+        effectRegistered = true;
+      }
+    }
+
+    void loop() override {
+      if (!WLED_CONNECTED) return;
+      unsigned long now = millis();
+      if (firstRun || now - lastFetch >= WT_REFRESH_MS) {
+        if (firstRun && now < 8000) return;   // let WiFi/NTP settle
+        firstRun = false;
+        lastFetch = now;
+        fetchWeather();
+        fetchTide();
+        DEBUG_PRINTF("[WT] temp=%.1f(%d) nice6=%.2f(%d) tideFrac=%.2f(%d)\n",
+                     tempNow, tempDir, good6, precipDir, tideFrac, tideDir);
+      }
+    }
+
+    uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
+};
+
+WeatherTideUsermod* WeatherTideUsermod::instance = nullptr;
+constexpr int WeatherTideUsermod::BAR_X[3];
