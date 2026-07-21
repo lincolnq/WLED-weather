@@ -15,6 +15,10 @@
   #include "../usermods/weather_tide/usermod_weather_tide.h"
 #endif
 
+#ifdef USERMOD_CYLINDER_GRID
+  #include "../usermods/cylinder_grid/usermod_cylinder_grid.h"
+#endif
+
 #ifdef USERMOD_BATTERY
   #include "../usermods/Battery/usermod_v2_Battery.h"
 #endif
@@ -257,6 +261,10 @@ void registerUsermods()
 
   #ifdef USERMOD_WEATHER_TIDE
   UsermodManager::add(new WeatherTideUsermod());
+  #endif
+
+  #ifdef USERMOD_CYLINDER_GRID
+  UsermodManager::add(new CylinderGridUsermod());
   #endif
 
   #ifdef USERMOD_BATTERY
